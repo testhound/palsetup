@@ -10,7 +10,7 @@ install: PalSetup
 main.o: /usr/local/include/backtester/*.h
 main_tradestation.o: /usr/local/include/backtester/*.h
 
-CCFLAGS := -O2 -c -Wall -std=c++14 -I/usr/local/include/backtester -I/usr/local/include/priceactionlab
+CCFLAGS := -O2 -c -Wall -std=c++17 -I/usr/local/include/backtester -I/usr/local/include/priceactionlab
 
 %.o: %.cpp
 	g++ $(CCFLAGS) $<
