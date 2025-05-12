@@ -51,65 +51,83 @@ createTimeSeriesReader (int fileType, const std::string& fileName, const Num& ti
   throw std::out_of_range (std::string ("Invalid file type"));
 }
 
-int main(int argc, char **argv)
-{
-  std::vector<std::string> v(argv, argv + argc);
-  if ((argc == 3) || (argc == 4))
-    {
-      std::string historicDataFileName (v[1]);
-      int fileType = std::stoi(v[2]);
+int main(int argc, char** argv) {
+    std::vector<std::string> v(argv, argv + argc);
+    if ((argc == 3) || (argc == 4)) {
+        std::string historicDataFileName(v[1]);
+        int fileType = std::stoi(v[2]);
 
-      Num securityTick (DecimalConstants<Num>::EquityTick);
+        Num securityTick(DecimalConstants<Num>::EquityTick);
 
-      if (argc == 4)
-	securityTick = Num (std::stof(v[3]));
+        if (argc == 4)
+            securityTick = Num(std::stof(v[3]));
 
-      shared_ptr <TimeSeriesCsvReader<Num>> reader;
-      if ((fileType >= 1) && fileType <= 5)
-	reader = createTimeSeriesReader (fileType, historicDataFileName, securityTick);
+        shared_ptr<TimeSeriesCsvReader<Num>> reader;
+        if ((fileType >= 1) && fileType <= 5)
+            reader = createTimeSeriesReader(fileType, historicDataFileName, securityTick);
 
-      
-      //CSIErrorCheckingExtendedFuturesCsvReader<Num> reader(historicDataFileName, 
-      //TimeFrame::DAILY,
-      //							 TradingVolume::CONTRACTS);
-      reader->readFile();
+        reader->readFile();
 
-      std::shared_ptr<OHLCTimeSeries<Num>> aTimeSeries = reader->getTimeSeries();
-      //boost::gregorian::date lastDate (aTimeSeries->getLastDate());
-      //OHLCTimeSeries<Num>::ConstTimeSeriesIterator entryIterator = aTimeSeries->getTimeSeriesEntry (lastDate);
-      //Num lastPrice (aTimeSeries->getCloseValue(entryIterator, 0));
-      
-      // boost::gregorian::date firstDate (1980, Jan, 1);
-      //OHLCTimeSeries<Num> dateFilteredSeries (FilterTimeSeries (*aTimeSeries, 
-      //						      DateRange (firstDate,
-      //								 aTimeSeries->getLastDate())));
-      int rocPeriod = 1;
+        std::shared_ptr<OHLCTimeSeries<Num>> aTimeSeries = reader->getTimeSeries();
 
-      
-      NumericTimeSeries<Num> closingPrices (aTimeSeries->CloseTimeSeries());
-      NumericTimeSeries<Num> rocOfClosingPrices (RocSeries (closingPrices, rocPeriod));
+        // 1. Get Ticker Symbol
+        std::string tickerSymbol;
+        std::cout << "Enter ticker symbol: ";
+        std::cin >> tickerSymbol;
 
-      
-      std::vector<Num> aSortedVec (rocOfClosingPrices.getTimeSeriesAsVector());
+        // 3. Split Data
+        size_t insampleSize = static_cast<size_t>(aTimeSeries->getNumEntries() * 0.8);
+        OHLCTimeSeries<Num> insampleSeries(aTimeSeries->getTimeFrame(), aTimeSeries->getVolumeUnits());
+        OHLCTimeSeries<Num> outOfSampleSeries(aTimeSeries->getTimeFrame(), aTimeSeries->getVolumeUnits());
 
-      Num medianOfRoc (Median (rocOfClosingPrices));
-      RobustQn<Num> robustDev (rocOfClosingPrices);
+        int count = 0;
+        for (auto it = aTimeSeries->beginSortedAccess(); it != aTimeSeries->endSortedAccess(); ++it)
+	  {
+	    const auto& entry = *it;
+            if (static_cast<size_t>(count) < insampleSize) 
+	      insampleSeries.addEntry(entry);
+	    else
+	      outOfSampleSeries.addEntry(entry);
 
-      Num robustQn (robustDev.getRobustQn());
+            count++;
+	  }
 
-      std::cout << "Median of roc of close = " << medianOfRoc << std::endl;
-      std::cout << "Qn of roc of close  = " << robustQn << std::endl;
+        // 4. Insample Stop Calculation
+        NumericTimeSeries<Num> closingPrices(insampleSeries.CloseTimeSeries());
+        NumericTimeSeries<Num> rocOfClosingPrices(RocSeries(closingPrices, 1));
 
-      PalTimeSeriesCsvWriter<Num> dumpFile("PalTimeSeries.csv", *aTimeSeries);
-      dumpFile.writeFile();
-      
-      //NumericTimeSeries<Num>::ConstTimeSeriesIterator it = rocOfClosingPrices.beginSortedAccess();
-      //for (; it != rocOfClosingPrices.endSortedAccess(); it++)
-      //	std::cout << it->first << "," << it->second->getValue() << std::endl;
+        Num medianOfRoc(Median(rocOfClosingPrices));
+        Num robustQn = RobustQn<Num>(rocOfClosingPrices).getRobustQn();
+	Num MAD (MedianAbsoluteDeviation<Num>(rocOfClosingPrices.getTimeSeriesAsVector()));
+	Num StdDev(StandardDeviation<Num>(rocOfClosingPrices.getTimeSeriesAsVector()));
+	
+        Num stopValue = medianOfRoc + robustQn;
+
+        // 2. Generate Target/Stop Files
+        std::ofstream tsFile1(tickerSymbol + "_0_5_.TRS");
+        tsFile1 << (stopValue * Num(0.5)) << std::endl << stopValue << std::endl;
+        tsFile1.close();
+
+        std::ofstream tsFile2(tickerSymbol + "_1_0_.TRS");
+        tsFile2 << stopValue << std::endl << stopValue << std::endl;
+        tsFile2.close();
+
+        // 5. Write Insample Data
+        PalTimeSeriesCsvWriter<Num> insampleWriter(tickerSymbol + "_IS.txt", insampleSeries);
+        insampleWriter.writeFile();
+
+	// 5. Write OOS Data
+        PalTimeSeriesCsvWriter<Num> oosampleWriter(tickerSymbol + "_OOS.txt", outOfSampleSeries);
+        oosampleWriter.writeFile();
+
+        std::cout << "Median = " << medianOfRoc << std::endl;
+        std::cout << "Qn  = " << robustQn << std::endl;
+	std::cout << "MAD  = " << MAD << std::endl;
+	std::cout << "Standard Deviation  = " << StdDev << std::endl;
+	std::cout << "Stop = " << stopValue << std::endl;
+
+    } else {
+        std::cout << "Usage (beta):: PalSetup datafile file-type (1 = CSI, 2 = CSI Extended, 3 = TradeStation, 4 = Pinnacle, 5 = PAL)" << std::endl;
     }
-  else
-    std::cout << "Usage (beta):: PalSetup datafile file-type (1 = CSI, 2 = CSI Extended, 3 = TradeStation, 4 = Pinnacle, 5 = PAL)" << std::endl;
-
+    return 0;
 }
-
-
