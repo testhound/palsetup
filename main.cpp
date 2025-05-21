@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <fstream>        // for ofstream
 #include <filesystem>     // for directory operations
+#include <limits>         // for numeric_limits
+#include <cctype>         // for std::toupper
 #include <boost/date_time/gregorian/gregorian.hpp>  // for to_iso_string
 
 #include "TimeSeriesCsvReader.h"
@@ -33,9 +35,9 @@ void writeConfigFile(const std::string& outputDir,
         return;
     }
 
-    std::string irPath      = "./" + tickerSymbol + "_IR.txt";
-    std::string dataPath    = "./" + tickerSymbol + "_Data.txt";
-    std::string fileFormat  = "PAL";
+    std::string irPath     = "./" + tickerSymbol + "_IR.txt";
+    std::string dataPath   = "./" + tickerSymbol + "_Data.txt";
+    std::string fileFormat = "PAL";
 
     // Dates in YYYYMMDD format
     std::string isDateStart  = to_iso_string(insampleSeries.getFirstDate());
@@ -105,27 +107,49 @@ int main(int argc, char** argv) {
         if (argc == 4)
             securityTick = Num(std::stof(argv[3]));
 
-        // 1. Read ticker symbol immediately
+        // 1. Read ticker symbol
         std::string tickerSymbol;
         std::cout << "Enter ticker symbol: ";
         std::cin >> tickerSymbol;
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
-        // 2. Read and parse time frame immediately
+        // 2. Read and parse time frame (default Daily)
         std::string timeFrameStr;
         TimeFrame::Duration timeFrame;
         bool validFrame = false;
         while (!validFrame) {
-            std::cout << "Enter time frame (Daily, Weekly, Monthly, Intraday): ";
-            std::cin >> timeFrameStr;
-            try {
-                timeFrame = getTimeFrameFromString(timeFrameStr);
-                validFrame = true;
-            } catch (const TimeFrameException& e) {
-                std::cerr << "Invalid time frame. Please enter one of: Daily, Weekly, Monthly, Intraday." << std::endl;
+            std::cout << "Enter time frame ([D]aily, [W]eekly, [M]onthly, [I]ntraday) [default D]: ";
+            std::string tfInput;
+            std::getline(std::cin, tfInput);
+            if (tfInput.empty()) tfInput = "D";
+            char c = std::toupper(tfInput[0]);
+            switch (c) {
+                case 'D': timeFrameStr = "Daily"; validFrame = true; break;
+                case 'W': timeFrameStr = "Weekly"; validFrame = true; break;
+                case 'M': timeFrameStr = "Monthly"; validFrame = true; break;
+                case 'I': timeFrameStr = "Intraday"; validFrame = true; break;
+                default:
+                    std::cerr << "Invalid time frame. Please enter D, W, M, or I." << std::endl;
             }
         }
+        timeFrame = getTimeFrameFromString(timeFrameStr);
 
-        // 1b. Prepare output directories
+        // 3. Read and parse reserve percentage (default 5%)
+        double reservedPercent = 5.0;
+        std::cout << "Enter percent of data to reserve (0-100, default 5): ";
+        std::string reservedPercentStr;
+        std::getline(std::cin, reservedPercentStr);
+        if (!reservedPercentStr.empty()) {
+            try {
+                reservedPercent = std::stod(reservedPercentStr);
+            } catch (...) {
+                std::cerr << "Invalid input for reserved percent. Using default 5%." << std::endl;
+                reservedPercent = 5.0;
+            }
+        }
+        reservedPercent = std::clamp(reservedPercent, 0.0, 100.0);
+
+        // 4. Prepare output directories
         fs::path baseDir = tickerSymbol + "_Validation";
         if (fs::exists(baseDir))
             fs::remove_all(baseDir);
@@ -134,7 +158,7 @@ int main(int argc, char** argv) {
         fs::create_directories(palDir);
         fs::create_directories(valDir);
 
-        // 3. Create and read time series with correct time frame
+        // 5. Create and read time series
         shared_ptr<TimeSeriesCsvReader<Num>> reader;
         if (fileType >= 1 && fileType <= 5) {
             reader = createTimeSeriesReader(fileType,
@@ -147,21 +171,29 @@ int main(int argc, char** argv) {
         reader->readFile();
         auto aTimeSeries = reader->getTimeSeries();
 
-        // 4. Split into in-sample (80%) and out-of-sample (20%)
-        size_t insampleSize = static_cast<size_t>(aTimeSeries->getNumEntries() * 0.8);
+        // 6. Split into insample, out-of-sample, and reserved (last)
+        size_t totalSize    = aTimeSeries->getNumEntries();
+        size_t reservedSize = static_cast<size_t>(totalSize * (reservedPercent / 100.0));
+        size_t remaining    = totalSize - reservedSize;
+        size_t insampleSize = static_cast<size_t>(remaining * 0.8);
+        size_t oosSize      = remaining - insampleSize;
+
+        OHLCTimeSeries<Num> reservedSeries(aTimeSeries->getTimeFrame(), aTimeSeries->getVolumeUnits());
         OHLCTimeSeries<Num> insampleSeries(aTimeSeries->getTimeFrame(), aTimeSeries->getVolumeUnits());
         OHLCTimeSeries<Num> outOfSampleSeries(aTimeSeries->getTimeFrame(), aTimeSeries->getVolumeUnits());
+
         size_t count = 0;
-        for (auto it = aTimeSeries->beginSortedAccess(); it != aTimeSeries->endSortedAccess(); ++it) {
+        for (auto it = aTimeSeries->beginSortedAccess(); it != aTimeSeries->endSortedAccess(); ++it, ++count) {
             const auto& entry = *it;
             if (count < insampleSize)
                 insampleSeries.addEntry(entry);
-            else
+            else if (count < insampleSize + oosSize)
                 outOfSampleSeries.addEntry(entry);
-            ++count;
+            else
+                reservedSeries.addEntry(entry);
         }
 
-        // 5. Insample stop calculation
+        // 7. Insample stop calculation
         NumericTimeSeries<Num> closingPrices(insampleSeries.CloseTimeSeries());
         NumericTimeSeries<Num> rocOfClosingPrices(RocSeries(closingPrices, 1));
         Num medianOfRoc(Median(rocOfClosingPrices));
@@ -170,7 +202,7 @@ int main(int argc, char** argv) {
         Num StdDev(StandardDeviation<Num>(rocOfClosingPrices.getTimeSeriesAsVector()));
         Num stopValue = medianOfRoc + robustQn;
 
-        // 6. Generate target/stop files in PAL_Files
+        // 8. Generate target/stop files
         std::ofstream tsFile1((palDir / (tickerSymbol + "_0_5_.TRS")).string());
         tsFile1 << (stopValue * Num(0.5)) << std::endl << stopValue << std::endl;
         tsFile1.close();
@@ -179,22 +211,27 @@ int main(int argc, char** argv) {
         tsFile2 << stopValue << std::endl << stopValue << std::endl;
         tsFile2.close();
 
-        // 7. Write insample data to PAL_Files and full/all data to Validation_Files
+        // 9. Write data files
         PalTimeSeriesCsvWriter<Num> insampleWriter((palDir / (tickerSymbol + "_IS.txt")).string(), insampleSeries);
         insampleWriter.writeFile();
-        PalTimeSeriesCsvWriter<Num> allDataWriter((valDir / (tickerSymbol + "_ALL.txt")).string(), *aTimeSeries);
-        allDataWriter.writeFile();
+        PalTimeSeriesCsvWriter<Num> allWriter((valDir / (tickerSymbol + "_ALL.txt")).string(), *aTimeSeries);
+        allWriter.writeFile();
         PalTimeSeriesCsvWriter<Num> oosWriter((valDir / (tickerSymbol + "_OOS.txt")).string(), outOfSampleSeries);
         oosWriter.writeFile();
+        if (reservedSize > 0) {
+            PalTimeSeriesCsvWriter<Num> reservedWriter((valDir / (tickerSymbol + "_reserved.txt")).string(), reservedSeries);
+            reservedWriter.writeFile();
+        }
 
-        // 8. Output statistics
+        // 10. Output statistics
+        std::cout << "Reserved% = " << reservedPercent << "%\n";
         std::cout << "Median = " << medianOfRoc << std::endl;
         std::cout << "Qn  = " << robustQn << std::endl;
         std::cout << "MAD = " << MAD << std::endl;
         std::cout << "Std = " << StdDev << std::endl;
         std::cout << "Stop = " << stopValue << std::endl;
 
-        // 9. Write configuration file to Validation_Files
+        // 11. Write configuration file
         writeConfigFile(valDir.string(), tickerSymbol, insampleSeries, outOfSampleSeries, timeFrameStr);
 
     } else {
